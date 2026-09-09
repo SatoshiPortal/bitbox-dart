@@ -1,8 +1,13 @@
-use anyhow::{anyhow, Result};
+use crate::wallet_policy::{ParsedWalletPolicy, PreparedWalletPolicy};
+use crate::wallet_policy_psbt::{filter_psbt_for_device_keys, validate_supported_sighashes};
+use anyhow::{anyhow, bail, Result};
 use bitbox_api::{NoiseConfigNoCache, PairedBitBox, PairingBitBox};
+use bitcoin::bip32::{DerivationPath, Fingerprint, Xpub};
+use bitcoin::NetworkKind;
 use flutter_rust_bridge::frb;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -26,6 +31,12 @@ pub struct DeviceInfo {
     pub name: String,
     pub version: String,
     pub initialized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitBoxKeychain {
+    Receive,
+    Change,
 }
 
 lazy_static! {
@@ -180,8 +191,6 @@ pub async fn verify_address(serial_number: String, keypath: String, testnet: boo
 
 #[frb]
 pub async fn sign_psbt(serial_number: String, psbt_str: String, testnet: bool) -> Result<String> {
-    use std::str::FromStr;
-
     let devices = BITBOX_DEVICES.lock().await;
     let bitbox = devices.get(&serial_number)
         .ok_or_else(|| anyhow!("Device not paired"))?;
@@ -197,4 +206,228 @@ pub async fn sign_psbt(serial_number: String, psbt_str: String, testnet: bool) -
 
     let out = psbt.to_string();
     Ok(out)
+}
+
+#[frb]
+pub async fn is_wallet_policy_registered(
+    serial_number: String,
+    descriptor: String,
+    testnet: bool,
+) -> Result<bool> {
+    let devices = BITBOX_DEVICES.lock().await;
+    let bitbox = devices
+        .get(&serial_number)
+        .ok_or_else(|| anyhow!("Device not paired"))?;
+    let policy = prepare_wallet_policy(bitbox, &descriptor, testnet).await?;
+    let registration_keypath = policy
+        .registration_keypath
+        .as_ref()
+        .map(bitbox_api::Keypath::from);
+
+    bitbox
+        .btc_is_script_config_registered(
+            coin(testnet),
+            &policy.script_config,
+            registration_keypath.as_ref(),
+        )
+        .await
+        .map_err(|error| anyhow!("Failed to check wallet registration: {error:?}"))
+}
+
+#[frb]
+pub async fn register_wallet_policy(
+    serial_number: String,
+    descriptor: String,
+    testnet: bool,
+    name: Option<String>,
+) -> Result<()> {
+    let devices = BITBOX_DEVICES.lock().await;
+    let bitbox = devices
+        .get(&serial_number)
+        .ok_or_else(|| anyhow!("Device not paired"))?;
+    let policy = prepare_wallet_policy(bitbox, &descriptor, testnet).await?;
+    let registration_keypath = policy
+        .registration_keypath
+        .as_ref()
+        .map(bitbox_api::Keypath::from);
+
+    bitbox
+        .btc_register_script_config(
+            coin(testnet),
+            &policy.script_config,
+            registration_keypath.as_ref(),
+            bitbox_api::pb::btc_register_script_config_request::XPubType::AutoXpubTpub,
+            name.as_deref(),
+        )
+        .await
+        .map_err(|error| anyhow!("Failed to register wallet: {error:?}"))
+}
+
+#[frb]
+pub async fn verify_wallet_address(
+    serial_number: String,
+    descriptor: String,
+    testnet: bool,
+    keychain: BitBoxKeychain,
+    index: i64,
+) -> Result<String> {
+    let index = address_index(index)?;
+
+    let devices = BITBOX_DEVICES.lock().await;
+    let bitbox = devices
+        .get(&serial_number)
+        .ok_or_else(|| anyhow!("Device not paired"))?;
+    let policy = prepare_wallet_policy(bitbox, &descriptor, testnet).await?;
+    let keypath =
+        policy.address_keypath(matches!(keychain, BitBoxKeychain::Change), index);
+
+    bitbox
+        .btc_address(
+            coin(testnet),
+            &bitbox_api::Keypath::from(&keypath),
+            &policy.script_config,
+            true,
+        )
+        .await
+        .map_err(|error| anyhow!("Failed to verify wallet address: {error:?}"))
+}
+
+#[frb]
+pub async fn sign_wallet_psbt(
+    serial_number: String,
+    descriptor: String,
+    psbt_str: String,
+    testnet: bool,
+) -> Result<String> {
+    let devices = BITBOX_DEVICES.lock().await;
+    let bitbox = devices
+        .get(&serial_number)
+        .ok_or_else(|| anyhow!("Device not paired"))?;
+    let policy = prepare_wallet_policy(bitbox, &descriptor, testnet).await?;
+    let mut psbt = bitcoin::psbt::Psbt::from_str(psbt_str.trim())
+        .map_err(|error| anyhow!("Invalid PSBT: {error:?}"))?;
+    validate_supported_sighashes(&psbt)?;
+
+    let mut signed = false;
+    while let Some((mut signing_psbt, device_key)) =
+        filter_psbt_for_device_keys(&psbt, policy.device_keys())?
+    {
+        bitbox
+            .btc_sign_psbt(
+                coin(testnet),
+                &mut signing_psbt,
+                Some(policy.script_config_with_keypath(device_key)),
+                bitbox_api::pb::btc_sign_init_request::FormatUnit::Default,
+            )
+            .await
+            .map_err(|error| anyhow!("Signing failed: {error:?}"))?;
+        crate::wallet_policy_psbt::restore_existing_signatures(&mut signing_psbt, &psbt);
+        if !crate::wallet_policy_psbt::merge_signatures(&mut psbt, signing_psbt)? {
+            bail!("BitBox did not add a signature");
+        }
+        signed = true;
+    }
+    if !signed {
+        bail!("PSBT does not contain an unsigned key controlled by the connected BitBox");
+    }
+
+    Ok(psbt.to_string())
+}
+
+async fn prepare_wallet_policy(
+    bitbox: &PairedBitBox<bitbox_api::runtime::TokioRuntime>,
+    descriptor: &str,
+    testnet: bool,
+) -> Result<PreparedWalletPolicy> {
+    let expected_network = if testnet {
+        NetworkKind::Test
+    } else {
+        NetworkKind::Main
+    };
+    let parsed = ParsedWalletPolicy::parse(descriptor, expected_network)?;
+    let fingerprint = bitbox
+        .root_fingerprint()
+        .await
+        .map_err(|error| anyhow!("Failed to get root fingerprint: {error:?}"))?
+        .parse::<Fingerprint>()
+        .map_err(|error| anyhow!("BitBox returned an invalid root fingerprint: {error}"))?;
+    let mut device_xpubs = HashMap::<DerivationPath, Xpub>::new();
+
+    for keypath in parsed.device_candidate_keypaths(fingerprint) {
+        if device_xpubs.contains_key(&keypath) {
+            continue;
+        }
+        let xpub = bitbox
+            .btc_xpub(
+                coin(testnet),
+                &bitbox_api::Keypath::from(&keypath),
+                if testnet {
+                    bitbox_api::pb::btc_pub_request::XPubType::Tpub
+                } else {
+                    bitbox_api::pb::btc_pub_request::XPubType::Xpub
+                },
+                false,
+            )
+            .await
+            .map_err(|error| anyhow!("Failed to derive wallet key: {error:?}"))?
+            .parse::<Xpub>()
+            .map_err(|error| anyhow!("BitBox returned an invalid extended public key: {error}"))?;
+        device_xpubs.insert(keypath, xpub);
+    }
+
+    let matching_keys = parsed.matching_device_key_indices(fingerprint, &device_xpubs);
+    let policy = parsed.prepare(&matching_keys)?;
+    ensure_firmware_support(bitbox, &policy, testnet)?;
+    Ok(policy)
+}
+
+fn ensure_firmware_support(
+    bitbox: &PairedBitBox<bitbox_api::runtime::TokioRuntime>,
+    policy: &PreparedWalletPolicy,
+    testnet: bool,
+) -> Result<()> {
+    let version = bitbox.version();
+    let version = (version.major, version.minor, version.patch);
+    if policy.is_taproot() {
+        if version < (9, 21, 0) {
+            bail!("BitBox firmware 9.21.0 or newer is required for Taproot policies");
+        }
+    } else if policy.is_miniscript() {
+        if version < (9, 15, 0) {
+            bail!("BitBox firmware 9.15.0 or newer is required for Miniscript policies");
+        }
+    } else if version < (9, 19, 0) && !policy.has_standard_multisig_keypath(testnet) {
+        bail!("BitBox firmware 9.19.0 or newer is required for this multisig keypath");
+    }
+    Ok(())
+}
+
+fn coin(testnet: bool) -> bitbox_api::pb::BtcCoin {
+    if testnet {
+        bitbox_api::pb::BtcCoin::Tbtc
+    } else {
+        bitbox_api::pb::BtcCoin::Btc
+    }
+}
+
+const MAX_RECEIVE_ADDRESS_INDEX: i64 = 9_999;
+
+fn address_index(index: i64) -> Result<u32> {
+    if !(0..=MAX_RECEIVE_ADDRESS_INDEX).contains(&index) {
+        bail!("address index must be between 0 and {MAX_RECEIVE_ADDRESS_INDEX}");
+    }
+    Ok(index as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::address_index;
+
+    #[test]
+    fn validates_address_index_before_converting_to_u32() {
+        assert_eq!(address_index(0).unwrap(), 0);
+        assert_eq!(address_index(9_999).unwrap(), 9_999);
+        assert!(address_index(-1).is_err());
+        assert!(address_index(10_000).is_err());
+    }
 }
