@@ -29,7 +29,7 @@ impl PlatformUsbBridge {
 }
 
 use async_trait::async_trait;
-use bitbox_api::communication::{Error as CommError, ReadWrite};
+use bitbox_api::{CommunicationError as CommError, ReadWrite};
 use bitbox_api::Threading;
 
 impl Threading for PlatformUsbBridge {}

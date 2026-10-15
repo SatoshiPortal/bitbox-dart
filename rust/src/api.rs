@@ -23,9 +23,6 @@ pub fn set_usb_read_data_wrapper(serial_number: String, data: Vec<u8>) -> Result
     crate::usb_bridge::set_usb_read_data(serial_number, data)
 }
 
-
-const FIRMWARE_CMD: u8 = 0x80 + 0x40 + 0x01;
-
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub name: String,
@@ -99,13 +96,8 @@ pub async fn start_pairing(serial_number: String) -> Result<Option<String>> {
     let usb_bridge = PlatformUsbBridge::new(serial_number.clone());
     let noise_config = NoiseConfigNoCache;
 
-    let comm = Box::new(bitbox_api::communication::U2fHidCommunication::from(
+    let bitbox = match bitbox_api::BitBox::<bitbox_api::runtime::TokioRuntime>::from_transport(
         Box::new(usb_bridge),
-        FIRMWARE_CMD,
-    ));
-
-    let bitbox = match bitbox_api::BitBox::<bitbox_api::runtime::TokioRuntime>::from(
-        comm,
         Box::new(noise_config),
     ).await {
         Ok(bb) => bb,
