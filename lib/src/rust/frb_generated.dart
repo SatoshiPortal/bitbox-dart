@@ -9,6 +9,8 @@ import 'dart:convert';
 import 'frb_generated.dart';
 import 'frb_generated.io.dart' if (dart.library.js_interop) 'frb_generated.web.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
+import 'native_asset_library.dart'
+    if (dart.library.js_interop) 'native_asset_library_web.dart';
 
 /// Main entrypoint of the Rust API
 class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
@@ -27,7 +29,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
     await instance.initImpl(
       api: api,
       handler: handler,
-      externalLibrary: externalLibrary,
+      externalLibrary: externalLibrary ?? nativeAssetLibrary(),
       forceSameCodegenVersion: forceSameCodegenVersion,
     );
   }
