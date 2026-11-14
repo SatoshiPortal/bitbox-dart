@@ -11,40 +11,37 @@ Flutter bindings for the BitBox02 hardware wallet using Rust and flutter_rust_br
 
 ## Prerequisites
 
-### macOS/Linux
+Use Flutter 3.50.0 (Dart 3.14) or newer and the Rust 1.100.0 toolchain pinned in `rust/rust-toolchain.toml`. Android consumers also need the Android SDK and NDK configured for Flutter.
+
+Install the pinned FRB code generator when changing the Rust API:
+
 ```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Add Android targets
-rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
-
-# Install flutter_rust_bridge codegen
-cargo install flutter_rust_bridge_codegen --version 2.9.0
-
-# Install LLVM (for macOS with Homebrew)
-brew install llvm
-
-# Install LLVM (for Ubuntu/Debian)
-sudo apt-get install libclang-dev llvm-dev
+make install-deps
 ```
 
 ## Setup
 
-1. Clone the repository
-2. Install toolchain dependencies (one-time):
+1. Clone the repository and resolve dependencies:
+
 ```bash
-make install-deps
+fvm flutter pub get --enforce-lockfile
 ```
-3. Generate bindings and build Android native libraries:
+
+2. When changing the Rust API, regenerate bindings through the package wrapper:
+
 ```bash
-make android
+make codegen
 ```
-4. Run the example app:
+
+The wrapper requires FRB codegen 2.13.0 and restores the default Native Assets loader after generation. See [tool/README.md](tool/README.md).
+
+3. Verify the default native library loads:
+
 ```bash
-cd example
-flutter run
+fvm flutter test test/native_asset_loader_test.dart
 ```
+
+The `hook/build.dart` Native Assets hook compiles the Rust crate with the locked dependencies and supplies the code asset to Flutter. Consuming applications build it automatically with their normal Flutter build commands; no separate `cargo ndk` build or manual `jniLibs` copying is required.
 
 ## Usage
 
@@ -104,19 +101,15 @@ Use `isWalletPolicyRegistered` and `registerWalletPolicy` before
 `verifyWalletAddress` or `signWalletPsbt`. Unsupported descriptors and firmware
 versions are rejected instead of being approximated.
 
-## Building for Production
+## Building a Consumer
 
-### Android
+Build the consuming Flutter application normally. For example, from an Android application's root:
 
-1. Build release version of Rust library:
 ```bash
-cargo ndk -t arm64-v8a -t armeabi-v7a -o android/src/main/jniLibs build --release
+fvm flutter build apk --debug --target-platform android-arm64
 ```
 
-2. Build Flutter app:
-```bash
-flutter build apk --release
-```
+Flutter invokes the package's Native Assets hook to build and bundle the Rust library for the selected target.
 
 ## License
 
